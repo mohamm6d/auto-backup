@@ -4,7 +4,7 @@
 CONFIG_FILE="$HOME/.sentinel_db.conf"
 CRON_TAG="# SENTINEL_DB_BACKUP"
 BACKUP_DIR="$HOME/db_backups"
-RETENTION_DAYS=30
+RETENTION_DAYS=10
 
 # --- Colors ---
 GREEN='\033[0;32m'
@@ -52,10 +52,49 @@ validate_and_save() {
     rm -f "$TMP_CONF"
 }
 
+load_retention() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local saved=$(get_cfg "RETENTION_DAYS")
+        [[ -n "$saved" ]] && RETENTION_DAYS=$saved
+    fi
+}
+
+configure_retention() {
+    load_retention
+    echo -e "\n--- Retention Policy ---"
+    echo "Current: $([ "$RETENTION_DAYS" -eq 0 ] && echo "Disabled" || echo "$RETENTION_DAYS days")"
+    echo "Set to 0 to disable automatic cleanup."
+    read -p "Retention days (default: $RETENTION_DAYS): " new_days
+    new_days=${new_days:-$RETENTION_DAYS}
+
+    if ! [[ "$new_days" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid number."; return 1
+    fi
+
+    RETENTION_DAYS=$new_days
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        grep -q "^RETENTION_DAYS=" "$CONFIG_FILE" \
+            && sed -i.bak "s/^RETENTION_DAYS=.*/RETENTION_DAYS=\"$RETENTION_DAYS\"/" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak" \
+            || echo "RETENTION_DAYS=\"$RETENTION_DAYS\"" >> "$CONFIG_FILE"
+    else
+        echo "RETENTION_DAYS=\"$RETENTION_DAYS\"" > "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+    fi
+
+    if [[ "$RETENTION_DAYS" -eq 0 ]]; then
+        log_success "Old backup cleanup disabled."
+    else
+        log_success "Old backups will be deleted after $RETENTION_DAYS days."
+    fi
+}
+
 run_backup_logic() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration not found. Run Option 1."; return 1
     fi
+
+    load_retention
 
     DB_HOST=$(get_cfg "DB_HOST")
     DB_USER=$(get_cfg "DB_USER")
@@ -74,10 +113,13 @@ run_backup_logic() {
     if mysqldump --defaults-extra-file="$CNF" --single-transaction --quick --lock-tables=false "$DB_NAME" > "$FILE"; then
         log_success "Backup created: $FILE"
         
-        # --- Housekeeping: Delete files older than 30 days ---
-        log_info "Cleaning up old backups (older than $RETENTION_DAYS days)..."
-        find "$BACKUP_DIR" -type f -name "${DB_NAME}_*.sql" -mtime +$RETENTION_DAYS -exec rm {} \;
-        log_success "Retention policy applied."
+        if [[ "$RETENTION_DAYS" -gt 0 ]]; then
+            log_info "Cleaning up backups older than $RETENTION_DAYS days..."
+            find "$BACKUP_DIR" -type f -name "${DB_NAME}_*.sql" -mtime +$RETENTION_DAYS -exec rm {} \;
+            log_success "Retention policy applied."
+        else
+            log_info "Retention cleanup disabled."
+        fi
     else
         log_error "Backup failed!"
         rm -f "$FILE"
@@ -111,22 +153,26 @@ fi
 
 check_deps
 while true; do
+    load_retention
+    retention_label=$([ "$RETENTION_DAYS" -eq 0 ] && echo "disabled" || echo "${RETENTION_DAYS}-day cleanup")
     echo -e "\n--- Sentinel-DB Backup Manager ---"
     echo "1) Setup/Update Credentials"
-    echo "2) Run Manual Backup (with 30-day cleanup)"
-    echo "3) Configure/Disable Cron"
-    echo "4) Uninstall (Wipe everything)"
-    echo "5) Exit"
+    echo "2) Run Manual Backup ($retention_label)"
+    echo "3) Configure Retention Policy (currently: $retention_label)"
+    echo "4) Configure/Disable Cron"
+    echo "5) Uninstall (Wipe everything)"
+    echo "6) Exit"
     read -p "Option: " opt
     case $opt in
         1) validate_and_save ;;
         2) run_backup_logic ;;
-        3) manage_cron ;;
-        4) 
+        3) configure_retention ;;
+        4) manage_cron ;;
+        5) 
             rm -f "$CONFIG_FILE"
             crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
             log_success "Credentials and schedules removed." 
             ;;
-        5) exit 0 ;;
+        6) exit 0 ;;
     esac
 done
