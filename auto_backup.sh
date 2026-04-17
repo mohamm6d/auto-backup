@@ -198,31 +198,28 @@ send_backup_email() {
 
     log_info "Sending $(basename "$latest_file") to $email..."
 
-    local encoded=$(base64 < "$latest_file")
     local filename=$(basename "$latest_file")
     local subject="Sentinel-DB Backup — $db_name — $(date +"%Y-%m-%d")"
 
-    local payload=$(cat <<ENDJSON
-{
-  "from": "Sentinel-DB <onboarding@resend.dev>",
-  "to": ["$email"],
-  "subject": "$subject",
-  "text": "Attached is today's database backup for $db_name.\nFile: $filename",
-  "attachments": [
-    {
-      "filename": "$filename",
-      "content": "$encoded"
-    }
-  ]
-}
-ENDJSON
-)
+    local payload_file=$(mktemp)
+    local encoded_file=$(mktemp)
+
+    base64 < "$latest_file" | tr -d '\n' > "$encoded_file"
+
+    printf '{"from":"Sentinel-DB <onboarding@resend.dev>","to":["%s"],"subject":"%s","text":"Attached is today'\''s database backup for %s.\\nFile: %s","attachments":[{"filename":"%s","content":"' \
+        "$email" "$subject" "$db_name" "$filename" "$filename" > "$payload_file"
+    cat "$encoded_file" >> "$payload_file"
+    printf '"}]}' >> "$payload_file"
+
+    rm -f "$encoded_file"
 
     local response
     response=$(curl -s -w "\n%{http_code}" -X POST 'https://api.resend.com/emails' \
         -H "Authorization: Bearer $api_key" \
         -H 'Content-Type: application/json' \
-        -d "$payload")
+        -d @"$payload_file")
+
+    rm -f "$payload_file"
 
     local http_code=$(echo "$response" | tail -1)
     local body=$(echo "$response" | sed '$d')
