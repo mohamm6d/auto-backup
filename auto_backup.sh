@@ -21,8 +21,17 @@ get_cfg() {
     grep "^$1=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/^"//;s/"$//'
 }
 
+set_cfg() {
+    local key=$1 val=$2
+    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i.bak "s|^${key}=.*|${key}=\"${val}\"|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    else
+        echo "${key}=\"${val}\"" >> "$CONFIG_FILE"
+    fi
+}
+
 check_deps() {
-    for cmd in mysql mysqldump crontab; do
+    for cmd in mysql mysqldump crontab curl base64; do
         if ! command -v $cmd &> /dev/null; then
             log_error "$cmd is not installed."
             exit 1
@@ -127,6 +136,104 @@ run_backup_logic() {
     rm -f "$CNF"
 }
 
+configure_email() {
+    echo -e "\n--- Email Notification Setup ---"
+    local current_enabled=$(get_cfg "EMAIL_ENABLED")
+    local current_email=$(get_cfg "BACKUP_EMAIL")
+
+    if [[ "$current_enabled" == "true" ]]; then
+        echo "Status: ENABLED (sending to $current_email)"
+        echo "1) Update settings"
+        echo "2) Disable email notifications"
+        echo "3) Back"
+        read -p "Choice: " e_opt
+        case $e_opt in
+            1) ;; # fall through to setup below
+            2)
+                sed -i.bak 's/^EMAIL_ENABLED=.*/EMAIL_ENABLED="false"/' "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+                log_success "Email notifications disabled."
+                return ;;
+            *) return ;;
+        esac
+    fi
+
+    read -p "Resend API Key: " api_key
+    if [[ -z "$api_key" ]]; then
+        log_error "API key cannot be empty."; return 1
+    fi
+
+    read -p "Recipient email address: " email_addr
+    if [[ -z "$email_addr" ]]; then
+        log_error "Email cannot be empty."; return 1
+    fi
+
+    set_cfg "RESEND_API_KEY" "$api_key"
+    set_cfg "BACKUP_EMAIL" "$email_addr"
+    set_cfg "EMAIL_ENABLED" "true"
+    chmod 600 "$CONFIG_FILE"
+
+    log_success "Email notifications enabled — backups will be sent to $email_addr"
+}
+
+send_backup_email() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration not found. Run Option 1."; return 1
+    fi
+
+    local enabled=$(get_cfg "EMAIL_ENABLED")
+    if [[ "$enabled" != "true" ]]; then
+        log_error "Email notifications are not enabled. Enable them first."; return 1
+    fi
+
+    local api_key=$(get_cfg "RESEND_API_KEY")
+    local email=$(get_cfg "BACKUP_EMAIL")
+    local db_name=$(get_cfg "DB_NAME")
+
+    local today=$(date +"%Y%m%d")
+    local latest_file=$(ls -t "$BACKUP_DIR"/${db_name}_${today}*.sql 2>/dev/null | head -1)
+
+    if [[ -z "$latest_file" ]]; then
+        log_error "No backup found for today ($today). Run a backup first."; return 1
+    fi
+
+    log_info "Sending $(basename "$latest_file") to $email..."
+
+    local encoded=$(base64 < "$latest_file")
+    local filename=$(basename "$latest_file")
+    local subject="Sentinel-DB Backup — $db_name — $(date +"%Y-%m-%d")"
+
+    local payload=$(cat <<ENDJSON
+{
+  "from": "Sentinel-DB <onboarding@resend.dev>",
+  "to": ["$email"],
+  "subject": "$subject",
+  "text": "Attached is today's database backup for $db_name.\nFile: $filename",
+  "attachments": [
+    {
+      "filename": "$filename",
+      "content": "$encoded"
+    }
+  ]
+}
+ENDJSON
+)
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X POST 'https://api.resend.com/emails' \
+        -H "Authorization: Bearer $api_key" \
+        -H 'Content-Type: application/json' \
+        -d "$payload")
+
+    local http_code=$(echo "$response" | tail -1)
+    local body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" == "200" ]]; then
+        log_success "Backup emailed to $email"
+    else
+        log_error "Failed to send email (HTTP $http_code): $body"
+    fi
+}
+
 manage_cron() {
     echo -e "\n--- Schedule Management ---"
     echo "1) Daily (00:00)"
@@ -148,6 +255,7 @@ manage_cron() {
 # --- Entry Point ---
 if [[ "$1" == "--internal-run" ]]; then
     run_backup_logic
+    [[ "$(get_cfg "EMAIL_ENABLED")" == "true" ]] && send_backup_email
     exit 0
 fi
 
@@ -155,24 +263,31 @@ check_deps
 while true; do
     load_retention
     retention_label=$([ "$RETENTION_DAYS" -eq 0 ] && echo "disabled" || echo "${RETENTION_DAYS}-day cleanup")
+    email_enabled=$(get_cfg "EMAIL_ENABLED")
+    email_label=$([[ "$email_enabled" == "true" ]] && echo "enabled" || echo "disabled")
+
     echo -e "\n--- Sentinel-DB Backup Manager ---"
     echo "1) Setup/Update Credentials"
     echo "2) Run Manual Backup ($retention_label)"
     echo "3) Configure Retention Policy (currently: $retention_label)"
     echo "4) Configure/Disable Cron"
-    echo "5) Uninstall (Wipe everything)"
-    echo "6) Exit"
+    echo "5) Email Notifications (currently: $email_label)"
+    echo "6) Send Today's Backup via Email Now"
+    echo "7) Uninstall (Wipe everything)"
+    echo "8) Exit"
     read -p "Option: " opt
     case $opt in
         1) validate_and_save ;;
         2) run_backup_logic ;;
         3) configure_retention ;;
         4) manage_cron ;;
-        5) 
+        5) configure_email ;;
+        6) send_backup_email ;;
+        7) 
             rm -f "$CONFIG_FILE"
             crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
             log_success "Credentials and schedules removed." 
             ;;
-        6) exit 0 ;;
+        8) exit 0 ;;
     esac
 done
